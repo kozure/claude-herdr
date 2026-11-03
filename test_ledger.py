@@ -248,6 +248,17 @@ def test_list_unsettled_skips_announced_terminal_rows(ledger):
     assert {"t-working", "t-unannounced-done"} <= ids
 
 
+def test_list_unsettled_skips_announced_lost_and_any_killed(ledger):
+    """`lost` settles on announcement; `killed` never announces at all."""
+    _row(ledger, "t-lost", "lost", notified="lost")
+    _row(ledger, "t-killed", "killed")
+    _row(ledger, "t-live-lost", "lost")            # not yet announced: keep it
+    ids = {r["task_id"] for r in ledger.list_unsettled()}
+    assert "t-lost" not in ids
+    assert "t-killed" not in ids
+    assert "t-live-lost" in ids
+
+
 def test_list_all_still_returns_everything(ledger):
     _row(ledger, "t-settled", "done", collected="2026-11-03T00:00:00+00:00", notified="done")
     assert {r["task_id"] for r in ledger.list_all()} == {"t-settled"}

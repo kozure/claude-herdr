@@ -180,8 +180,9 @@ class Ledger:
         rows = self.conn.execute("SELECT * FROM tasks").fetchall()
         return [dict(r) for r in rows]
 
-    #: `last_state` values that mean the session is finished.
-    TERMINAL_STATES = ("done", "blocked", "killed")
+    #: `last_state` values that mean the session is finished and has nothing
+    #: left to announce.
+    TERMINAL_STATES = ("done", "blocked", "lost", "collected")
 
     def list_unsettled(self):
         """Rows a periodic watcher still needs to look at.
@@ -191,9 +192,13 @@ class Ledger:
         re-polling it forever is what made each watcher tick grow with the
         ledger's whole history (2026-11-03 review, finding 9). A new prompt
         resets `last_state` to `working`, which makes the row unsettled again.
+
+        `killed` is settled unconditionally: the watcher never announces it
+        (a deliberate kill has nothing to report), so waiting for a
+        `notified_state` that will never be written would poll it forever.
         """
         rows = self.conn.execute(
-            "SELECT * FROM tasks WHERE NOT ("
+            "SELECT * FROM tasks WHERE last_state != 'killed' AND NOT ("
             "  notified_state IS NOT NULL"
             "  AND notified_state = last_state"
             "  AND last_state IN ({})"

@@ -84,7 +84,11 @@ def watch_once(bridge=None, ledger=None, poller=None, notifier=None,
     polls = {p["task_id"]: p for p in (poller() or []) if p.get("task_id")}
     announced, skipped, failed, baselined = [], [], [], []
 
-    for row in ledger.list_all():
+    # Iterate the same settled-filtered view the poller used. Walking every row
+    # ever written just to skip it is the other half of the "slower every
+    # minute" problem (2026-11-03 review, finding 9).
+    rows = getattr(ledger, "list_unsettled", ledger.list_all)()
+    for row in rows:
         task_id = row["task_id"]
         poll = polls.get(task_id)
         if poll is None:

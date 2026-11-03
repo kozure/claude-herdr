@@ -563,3 +563,7 @@ Thresholds resolve per row as `row value ?? liveness.toml ?? restated defaults`.
   statements, each committed before the next step, and **no write transaction
   held across a dispatch**. The remedy — an explicit `timeout=` on
   `ledger.py`'s connect — is a `ledger.py` change owned by a later item.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

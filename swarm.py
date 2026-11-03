@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from bridge import Bridge, ALLOWED_CWD, cwd_allowed
-from trust import preseed_trust
+from trust import preseed_trust  # noqa: F401 — re-exported for callers/tests
 
 
 # Timing constants (from spec)
@@ -50,6 +50,7 @@ class SwarmHandle:
     task: str                    # the swarm's mission prompt
     launched_at: str = ""
     state: str = "launching"
+    orchestrator_agent_id: str = ""   # who coordinates; used in the peer prompt
     # Internal
     _pending_peer_requests: set[tuple[str, str]] = field(default_factory=set)
     _bridge: Any = field(default=None, repr=False)
@@ -84,22 +85,25 @@ def launch(
     bridge = bridge or Bridge()
     swarm_id = uuid.uuid4().hex[:12]
 
-    # Create shared workspace + trust preseed
-    trust = preseed_trust(os.path.realpath(cwd))
-    real_cwd = trust.get("key", os.path.realpath(cwd))
-    ws = bridge.herdr.workspace_create(cwd=real_cwd)
-    workspace_id = ws.get("workspace_id", "")
+    # No shared workspace is created here: `Bridge.send()` (called once per
+    # session below with no pane_id) creates each session's own workspace and
+    # pre-seeds trust itself. The shared-workspace path needs herdr
+    # `pane_split`, which is deferred — until then a workspace created here
+    # would be created, never used, and never closed: a leak per launch
+    # (2026-11-03 review).
+    real_cwd = os.path.realpath(cwd)
 
     handle = SwarmHandle(
         swarm_id=swarm_id,
         roles={},
         task_ids=[],
         mcp_config_paths={},
-        workspace_id=workspace_id,
+        workspace_id="",
         cwd=real_cwd,
         task=task,
         launched_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         state="launching",
+        orchestrator_agent_id=orchestrator_agent_id,
         _bridge=bridge,
     )
 
@@ -187,7 +191,7 @@ def coordinate(handle: SwarmHandle) -> None:
         prompt = (
             f"You are {role} in swarm {handle.swarm_id}. Your peers:\n\n"
             f"{peer_section}\n\n"
-            f"The orchestrator (alfred) "
+            f"The orchestrator ({handle.orchestrator_agent_id or 'the coordinator'}) "
             f"is at session_id=\"swarm-{handle.swarm_id}-{role}\".\n\n"
             f"Peer messages take 60-300s round-trip. Be patient. "
             f"Coordinate as needed.\n\n"

@@ -91,6 +91,30 @@ def list_jobs(jobs_dir):
     return out
 
 
+def _claim_lock(path):
+    """Take the per-job claim lock atomically. False when someone else holds it.
+
+    `claim_next` used to read every STATUS, pick a queued one, then rewrite it:
+    two callers racing each other both saw `queued` and both claimed the same
+    job (2026-11-03 review). O_CREAT|O_EXCL is the one atomic primitive the
+    filesystem gives us here; the status rewrite is the durable marker and the
+    lock only serialises the read-check-write.
+    """
+    lock = path + ".claim"
+    try:
+        os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+    except FileExistsError:
+        return False
+    return True
+
+
+def _release_lock(path):
+    try:
+        os.unlink(path + ".claim")
+    except FileNotFoundError:
+        pass
+
+
 def claim_next(jobs_dir, worker_limit=None, active_sessions=0):
     """Claim the FIFO-first queued job, if allowed.
 
@@ -105,10 +129,20 @@ def claim_next(jobs_dir, worker_limit=None, active_sessions=0):
     if worker_limit is not None and active_sessions >= worker_limit:
         return None
     for job in ordered:
-        if job.status == "queued":
+        if job.status != "queued":
+            continue
+        if not _claim_lock(job.path):
+            continue                     # another caller is claiming it
+        try:
+            # Re-read under the lock: the snapshot above may be stale.
+            current = Job(job.path)
+            if current.status != "queued":
+                continue
             _set_status(job.path, "active")
-            job.status = "active"
-            return job
+            current.status = "active"
+            return current
+        finally:
+            _release_lock(job.path)
     return None
 
 
@@ -151,8 +185,19 @@ def mark_done(jobs_dir, slug):
     return None
 
 
+#: Bridge-dispatched sessions are named `task-<8 hex>` (bridge.send). Anything
+#: else in `agent_list` was started directly by another agent and is not one of
+#: the steward's promoted jobs (AGENTS.md N5 disclosure).
+PROMOTED_NAME_RE = re.compile(r"^task-[0-9a-f]{8}$")
+
+
 def count_active_sessions(client):
-    """Number of live herdr sessions backing promoted jobs.
+    """Number of live herdr sessions backing *promoted* jobs.
+
+    Counts only `task-<hex>` sessions, the names the bridge gives its own
+    launches. It used to count every herdr agent, so guest sessions started
+    directly against the shared contract consumed the steward's cap of 3 —
+    the opposite of the N5 disclosure this module's header promises.
 
     Tolerates herdr being down (returns 0 — the cap then never blocks,
     which is the safe direction for a soft cap: losing the counter must
@@ -160,9 +205,10 @@ def count_active_sessions(client):
     """
     try:
         sessions = client.agent_list() or []
-        return len(sessions)
     except Exception:                            # noqa: BLE001
         return 0
+    return sum(1 for s in sessions
+               if PROMOTED_NAME_RE.match(str((s or {}).get("name", ""))))
 
 
 def load_worker_limit(toml_path):

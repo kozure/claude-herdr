@@ -286,9 +286,9 @@ def _validate_ref(payload_ref: str | None) -> None:
 
 # --- The frozen callable surface -------------------------------------------
 #
-# Owner parent is named on every stub, and every body raises. Nothing here is
-# implemented at `0.0`: the point is that `4.0` may be written against these
-# signatures while `1.0`–`3.0` fill them in.
+# Owner parent is named on every callable. Parents `1.0`, `2.0` and `3.0` have
+# landed; only the stubs owned by `4.0` still raise `NotImplementedError`, and
+# `test_stub_body_raises_not_implemented` is what enforces that split.
 
 def add_job(
     conn: sqlite3.Connection,

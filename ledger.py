@@ -51,7 +51,11 @@ class Ledger:
             parent = os.path.dirname(self.db_path)
             if parent:
                 os.makedirs(parent, exist_ok=True)
-            self._conn = sqlite3.connect(self.db_path)
+            # 5 s busy_timeout: the timer, the watcher and guest agents all
+            # write this one file, and a bare connect means Python's implicit
+            # default — a `database is locked` raised into code that does not
+            # handle it (2026-11-03 review, finding 11).
+            self._conn = sqlite3.connect(self.db_path, timeout=5.0)
             self._conn.row_factory = sqlite3.Row
         return self._conn
 
@@ -67,6 +71,9 @@ class Ledger:
             self._backup_and_add_mcp_columns()
         if self.table_exists("tasks") and "notified_at" not in self.get_columns("tasks"):
             self._backup_and_add_notified_columns()
+        # WAL: readers (the watcher, a poll) no longer block the writer (the
+        # timer). `:memory:` reports "memory" and ignores the request.
+        self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute(SCHEMA)
         self.conn.commit()
 
@@ -171,6 +178,28 @@ class Ledger:
     def list_all(self):
         """Get all task rows."""
         rows = self.conn.execute("SELECT * FROM tasks").fetchall()
+        return [dict(r) for r in rows]
+
+    #: `last_state` values that mean the session is finished.
+    TERMINAL_STATES = ("done", "blocked", "killed")
+
+    def list_unsettled(self):
+        """Rows a periodic watcher still needs to look at.
+
+        A row is settled once it is in a terminal state *and* that state has
+        already been announced: there is nothing left to learn about it, and
+        re-polling it forever is what made each watcher tick grow with the
+        ledger's whole history (2026-11-03 review, finding 9). A new prompt
+        resets `last_state` to `working`, which makes the row unsettled again.
+        """
+        rows = self.conn.execute(
+            "SELECT * FROM tasks WHERE NOT ("
+            "  notified_state IS NOT NULL"
+            "  AND notified_state = last_state"
+            "  AND last_state IN ({})"
+            ")".format(", ".join("?" for _ in self.TERMINAL_STATES)),
+            self.TERMINAL_STATES,
+        ).fetchall()
         return [dict(r) for r in rows]
 
     def update_last_state(self, task_id, state):

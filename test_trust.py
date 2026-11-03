@@ -209,3 +209,60 @@ class TestPreseedTrust:
         os.chmod(cfg, 0o600)
         preseed_trust(cwd, config_path=cfg)
         assert oct(os.stat(cfg).st_mode)[-3:] == "600"
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-03 review, finding 10: the read-modify-write loses concurrent writes
+# ---------------------------------------------------------------------------
+
+def test_a_concurrent_write_between_read_and_replace_is_not_dropped(tmp_path, monkeypatch):
+    """Claude Code rewrites ~/.claude.json continuously.
+
+    The atomic replace prevents a torn file but not a lost update. If the file
+    changes between the read and the replace, the pass must re-read and re-apply
+    instead of overwriting whatever landed in between.
+    """
+    import trust
+
+    config = tmp_path / ".claude.json"
+    config.write_text(json.dumps({"projects": {}}))
+
+    stats = {"n": 0}
+    real_stat = trust._stat_ns
+
+    def racing_stat(path):
+        stats["n"] += 1
+        if stats["n"] == 2:            # the stat taken right after the read
+            live = json.loads(config.read_text())
+            live["written_by_claude_code"] = {"mid_flight": True}
+            config.write_text(json.dumps(live))
+        return real_stat(path)
+
+    monkeypatch.setattr(trust, "_stat_ns", racing_stat)
+    result = preseed_trust(f"{HOME}/DEV/raced", config_path=str(config))
+
+    written = json.loads(config.read_text())
+    assert written["written_by_claude_code"] == {"mid_flight": True}
+    assert written["projects"][normalized_key(f"{HOME}/DEV/raced")]["hasTrustDialogAccepted"] is True
+    assert set(result["changed"]) == set(TRUST_KEYS)
+
+
+def test_a_file_that_never_settles_reports_config_busy(tmp_path, monkeypatch):
+    """Every stat differs, so every attempt sees a mid-flight write."""
+    import trust
+
+    config = tmp_path / ".claude.json"
+    original = json.dumps({"projects": {}})
+    config.write_text(original)
+    calls = {"n": 0}
+
+    def always_changing(path):
+        calls["n"] += 1
+        return calls["n"]
+
+    monkeypatch.setattr(trust, "_stat_ns", always_changing)
+    result = preseed_trust(f"{HOME}/DEV/never", config_path=str(config))
+
+    assert result["error"] == "config_busy"
+    assert calls["n"] == 2 * trust.TRUST_WRITE_ATTEMPTS     # stat before + after each read
+    assert config.read_text() == original                   # nothing clobbered

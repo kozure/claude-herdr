@@ -204,3 +204,50 @@ def test_ledger_creates_missing_parent_dir(tmp_path):
     led = Ledger(str(db))
     led.init_schema()                      # must not raise
     assert db.exists()
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-03 review, finding 11 + finding 9 (settled rows)
+# ---------------------------------------------------------------------------
+
+def test_file_ledger_uses_wal(tmp_path):
+    """The timer, the watcher and guest agents share one file."""
+    db = Ledger(str(tmp_path / "ledger.db"))
+    db.init_schema()
+    mode = db.conn.execute("PRAGMA journal_mode").fetchone()[0]
+    db.close()
+    assert mode.lower() == "wal"
+
+
+def test_connect_waits_on_a_locked_database(tmp_path):
+    db = Ledger(str(tmp_path / "ledger.db"))
+    db.init_schema()
+    busy = db.conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    db.close()
+    assert busy >= 5000
+
+
+def _row(db, task_id, last_state, collected=None, notified=None):
+    db.insert_task(task_id=task_id, pane_id="p1", workspace_id="w1", session_id="s",
+                   prompt="p", cwd="/tmp", timeout_min=30)
+    db.update_last_state(task_id, last_state)
+    if collected:
+        db.conn.execute("UPDATE tasks SET collected_at = ? WHERE task_id = ?",
+                        (collected, task_id))
+    if notified:
+        db.mark_notified(task_id, notified)
+    db.conn.commit()
+
+
+def test_list_unsettled_skips_announced_terminal_rows(ledger):
+    _row(ledger, "t-settled", "done", collected="2026-11-03T00:00:00+00:00", notified="done")
+    _row(ledger, "t-working", "working")
+    _row(ledger, "t-unannounced-done", "done", collected="2026-11-03T00:00:00+00:00")
+    ids = {r["task_id"] for r in ledger.list_unsettled()}
+    assert "t-settled" not in ids
+    assert {"t-working", "t-unannounced-done"} <= ids
+
+
+def test_list_all_still_returns_everything(ledger):
+    _row(ledger, "t-settled", "done", collected="2026-11-03T00:00:00+00:00", notified="done")
+    assert {r["task_id"] for r in ledger.list_all()} == {"t-settled"}

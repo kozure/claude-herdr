@@ -1151,3 +1151,43 @@ def test_server_down_message_names_the_installed_plist():
     import bridge as bridge_module
     assert "com.alfred.herdr.plist" in bridge_module.HERDR_DOWN_MSG
     assert "com.luther" not in bridge_module.HERDR_DOWN_MSG
+
+
+class TestPollAllUsesOneSnapshot:
+    """Finding 9: one `agent_list` for the whole pass, settled rows skipped."""
+
+    def _seed(self, ledger, task_id, state="working"):
+        ledger.insert_task(task_id=task_id, pane_id="p1", workspace_id="w1",
+                           session_id="s", prompt="p", cwd=f"{HOME}/DEV",
+                           timeout_min=30)
+        ledger.update_last_state(task_id, state)
+
+    def test_one_agent_list_and_no_per_task_agent_get(self, bridge, mock_herdr,
+                                                      in_memory_ledger):
+        self._seed(in_memory_ledger, "task-aaaa1111")
+        self._seed(in_memory_ledger, "task-bbbb2222")
+        mock_herdr.agent_list.return_value = [
+            {"name": "task-aaaa1111", "agent_status": "working"},
+            {"name": "task-bbbb2222", "agent_status": "working"},
+        ]
+        results = bridge.poll_all()
+        assert mock_herdr.agent_list.call_count == 1
+        assert mock_herdr.agent_get.call_count == 0
+        assert {r["task_id"] for r in results} == {"task-aaaa1111", "task-bbbb2222"}
+
+    def test_an_announced_terminal_row_is_not_polled_at_all(self, bridge, mock_herdr,
+                                                            in_memory_ledger):
+        self._seed(in_memory_ledger, "task-done0001", state="done")
+        in_memory_ledger.conn.execute(
+            "UPDATE tasks SET collected_at = '2026-11-03T00:00:00+00:00'"
+            " WHERE task_id = 'task-done0001'")
+        in_memory_ledger.conn.commit()
+        in_memory_ledger.mark_notified("task-done0001", "done")
+        self._seed(in_memory_ledger, "task-live0001")
+        mock_herdr.agent_list.return_value = [
+            {"name": "task-done0001", "agent_status": "idle"},
+            {"name": "task-live0001", "agent_status": "working"},
+        ]
+        bridge.poll_all()
+        assert mock_herdr.agent_list.call_count == 1
+        assert mock_herdr.agent_get.call_count == 0

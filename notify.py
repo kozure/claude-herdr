@@ -94,11 +94,19 @@ def _build_text(run_id, verdict, grade, report_path, digest):
 def notify_completion(run_id, verdict, grade, report_path, digest,
                       notice_dir=None, transport=None):
     """Fire the 3-layer notify. Returns a status string:
-    'sent' | 'fallback' | 'UNSENT: <reason>'. Never raises past the caller.
+    'sent' | 'fallback' | 'UNSENT: <reason>'.
+
+    Never raises *past* the caller in the sense that every failure is turned
+    into a status string — but the last-resort marker write at the end can
+    still raise if the notice directory cannot be created or written, which is
+    deliberate: a silent notify failure is the one outcome that must not pass.
     """
     transport = transport or SubprocessTransport()
     if notice_dir is None:
-        notice_dir = os.path.join("cases", run_id)
+        # Absolute: a relative path would put the marker in whatever directory
+        # the process happened to start in (2026-11-03 review).
+        notice_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "cases", run_id)
     text = _build_text(run_id, verdict, grade, report_path, digest)
     task_id = None
     reason = None

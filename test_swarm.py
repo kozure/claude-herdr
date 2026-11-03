@@ -130,8 +130,10 @@ class TestSwarmLaunch(unittest.TestCase):
         self.assertEqual(handle.roles["claude-2"], "task-s002")
         self.assertEqual(handle.roles["claude-3"], "task-s003")
         self.assertEqual(handle.state, "launched")
-        # Workspace created once
-        b.herdr.workspace_create.assert_called_once()
+        # No shared workspace: Bridge.send() creates one per session, and the
+        # shared-workspace path is deferred until herdr pane_split lands.
+        b.herdr.workspace_create.assert_not_called()
+        self.assertEqual(handle.workspace_id, "")
 
     def test_launch_size_2(self, _):
         b = make_mock_bridge()

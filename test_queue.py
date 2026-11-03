@@ -132,7 +132,7 @@ class TestWorkerLimit:
     def test_count_active_sessions_uses_agent_list(self):
         class FakeClient:
             def agent_list(self):
-                return [{"id": "a"}, {"id": "b"}]
+                return [{"name": "task-1a2b3c4d"}, {"name": "task-5e6f7a8b"}]
         assert count_active_sessions(FakeClient()) == 2
 
     def test_count_active_sessions_tolerates_errors(self):
@@ -182,3 +182,61 @@ class TestWorkerLimitConfig:
         cfg = os.path.join(tmp_path, "liveness.toml")
         open(cfg, "w").write("[tiers]\nwarn_after_s = 900\n")
         assert load_worker_limit(cfg) == 3
+
+
+# --- 2026-11-03 review: the worker cap counts promoted jobs only ------------
+
+class TestWorkerCapScope:
+    def test_guest_sessions_do_not_consume_the_cap(self):
+        from job_queue import count_active_sessions
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.agent_list.return_value = [
+            {"name": "task-1a2b3c4d"},        # bridge-promoted
+            {"name": "task-9f8e7d6c"},
+            {"name": "luther-standalone"},    # guest session, not ours
+            {"name": "swarm-abc-claude-1"},   # guest session, not ours
+            {},
+        ]
+        assert count_active_sessions(client) == 2
+
+    def test_herdr_down_returns_zero(self):
+        from job_queue import count_active_sessions
+        from unittest.mock import MagicMock
+
+        client = MagicMock()
+        client.agent_list.side_effect = RuntimeError("down")
+        assert count_active_sessions(client) == 0
+
+
+class TestClaimIsAtomic:
+    def test_a_stale_snapshot_cannot_double_claim(self, tmp_path):
+        """Two callers both read `queued`; only one may win the file."""
+        from job_queue import create_job, list_jobs, claim_next, Job
+
+        create_job(tmp_path, "only-one", "brief")
+        stale = list_jobs(tmp_path)                     # snapshot A
+        first = claim_next(tmp_path)
+        assert first is not None and first.status == "active"
+
+        # Caller B still believes the snapshot: force list_jobs to return it.
+        import job_queue as jq
+        real = jq.list_jobs
+        jq.list_jobs = lambda d: [Job(p.path) for p in stale]
+        try:
+            for j in jq.list_jobs(tmp_path):
+                j.status = "queued"                     # B's stale view
+            second = claim_next(tmp_path)
+        finally:
+            jq.list_jobs = real
+        # B re-reads under the lock and sees `active`, so it must not claim.
+        assert second is None
+
+    def test_a_held_lock_blocks_the_claim(self, tmp_path):
+        from job_queue import create_job, list_jobs, claim_next
+
+        path = create_job(tmp_path, "locked", "brief")
+        open(path + ".claim", "w").close()              # someone else holds it
+        assert claim_next(tmp_path) is None
+        assert list_jobs(tmp_path)[0].status == "queued"

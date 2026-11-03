@@ -59,6 +59,9 @@ def cwd_allowed(cwd: str) -> bool:
 
 
 UNKNOWN_RETRY_INTERVAL = 2
+#: Marker for "no snapshot supplied" in `poll()`; `None` means the snapshot
+#: found no such agent, which is a different answer.
+_SNAPSHOT_UNSET = object()
 UNKNOWN_MAX_RETRIES = 5
 IDLE_CONFIRMATIONS = 3
 #: Wall-clock ceiling for the readiness handshake. Without it the loop below
@@ -188,9 +191,9 @@ class Bridge:
         mcp_pair is not explicitly False, the spawned Claude gets bidirectional
         MCP tools to talk back to its spawner. Pass mcp_pair=False to opt out.
 
-        Workspace sharing (pane_id): when provided, skip workspace_create,
-        preseed_trust, and cwd enforcement — the caller owns the workspace.
-        Used by swarm.py for shared-workspace multi-session launches.
+        Workspace sharing (pane_id): when provided, skip workspace_create and
+        trust preseed — the caller owns the workspace. The cwd is still
+        checked: the pane runs Claude in it either way.
         """
         cwd = cwd or self.default_cwd
         if not cwd_allowed(cwd):
@@ -360,12 +363,20 @@ class Bridge:
         except HerdrServerDown:
             return {"error": "herdr_server_down", "message": HERDR_DOWN_MSG}
 
-    def poll(self, task_id):
+    def poll(self, task_id, agent=_SNAPSHOT_UNSET):
+        """Poll one task.
+
+        `agent` may be a row taken from a single `agent_list` snapshot (see
+        `poll_all`); when supplied, no per-task `agent_get` is issued and the
+        retry ladder is skipped. Absent is distinct from `None`: `None` means
+        "this snapshot has no such agent".
+        """
         row = self.ledger.get_task(task_id)
         if not row:
             return {"error": "task_not_found", "task_id": task_id}
         try:
-            agent = self._agent_get_with_retry(task_id)
+            if agent is _SNAPSHOT_UNSET:
+                agent = self._agent_get_with_retry(task_id)
             if agent is None:
                 return {"task_id": task_id, "state": "unknown",
                         "message": "agent state undetectable after 10s — may need manual check"}
@@ -387,14 +398,15 @@ class Bridge:
                 self.ledger.update_last_state(task_id, "blocked")
                 return self._resp(task_id, row, "blocked")
             if herdr_status in ("idle", "done"):
-                if last_state == "killed":
-                    return self._resp(task_id, row, "killed")
                 if collected is not None:
                     return self._cached(task_id, row)
+                # `last_state == "killed"` is already answered above, before
+                # any herdr status is consulted; `pending and last_state in
+                # ("idle", None, "unknown")` already covers `last_state ==
+                # "unknown" and pending`. Both clauses were unreachable.
                 should_collect = (
                     last_state == "working" or
-                    (pending and last_state in ("idle", None, "unknown")) or
-                    (last_state == "unknown" and pending))
+                    (pending and last_state in ("idle", None, "unknown")))
                 if last_state == "blocked":
                     should_collect = False
                 if should_collect:
@@ -413,18 +425,26 @@ class Bridge:
             raise
 
     def poll_all(self):
-        """Poll all tasks. Returns list of poll results."""
+        """Poll all unsettled tasks. Returns list of poll results.
+
+        One `agent_list` snapshot serves every row, and rows whose terminal
+        state is already announced are skipped: the previous version called
+        `agent_get` per row (each retrying up to 5 times, 2 s apart) over the
+        ledger's entire history, so a 60 s tick got slower every minute
+        (2026-11-03 review, finding 9).
+        """
+        rows = getattr(self.ledger, "list_unsettled", self.ledger.list_all)()
         try:
             agents = self.herdr.agent_list()
         except HerdrServerDown:
             return [{"task_id": r["task_id"], "state": "daemon_down",
-                     "message": "herdr server unreachable"} for r in self.ledger.list_all()]
+                     "message": "herdr server unreachable"} for r in rows]
         agent_map = {a["name"]: a for a in agents}
         results = []
-        for row in self.ledger.list_all():
+        for row in rows:
             tid = row["task_id"]
             if tid in agent_map:
-                results.append(self.poll(tid))
+                results.append(self.poll(tid, agent=agent_map[tid]))
             else:
                 results.append({"task_id": tid, "state": "lost",
                                 "message": "Task not found in herdr — may need manual restart"})
@@ -469,10 +489,8 @@ class Bridge:
             return {"error": "task_not_found", "task_id": task_id}
         # Clean up MCP temp config BEFORE closing pane (still have row data)
         if row.get("mcp_config_path"):
-            try:
-                os.unlink(row["mcp_config_path"])
-            except FileNotFoundError:
-                pass
+            from mcp_pair import cleanup_config
+            cleanup_config(row["mcp_config_path"])
             self.ledger.clear_mcp_path(task_id)
         try:
             self.herdr.pane_close(row["herdr_pane_id"])
@@ -509,10 +527,8 @@ class Bridge:
             else:
                 # Lost task: clean up MCP temp config if present
                 if row.get("mcp_config_path"):
-                    try:
-                        os.unlink(row["mcp_config_path"])
-                    except FileNotFoundError:
-                        pass
+                    from mcp_pair import cleanup_config
+                    cleanup_config(row["mcp_config_path"])
                     self.ledger.clear_mcp_path(tid)
                 results.append({"task_id": tid, "status": "lost",
                                 "claude_session_id": row["claude_session_id"]})

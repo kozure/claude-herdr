@@ -42,6 +42,10 @@ import tempfile
 
 TRUST_KEYS = ("hasTrustDialogAccepted", "hasClaudeMdExternalIncludesApproved")
 
+#: How many read-modify-write rounds before giving up on a file that keeps
+#: changing under us (see `preseed_trust`).
+TRUST_WRITE_ATTEMPTS = 5
+
 
 def claude_config_path():
     """Resolve the Claude Code config file, honouring CLAUDE_CONFIG_DIR."""
@@ -56,6 +60,14 @@ def normalized_key(path):
     return os.path.realpath(os.path.expanduser(path)).replace(os.sep, "/")
 
 
+def _stat_ns(path):
+    """Modification time in ns, or None when the file does not exist."""
+    try:
+        return os.stat(path).st_mtime_ns
+    except OSError:
+        return None
+
+
 def preseed_trust(cwd, config_path=None):
     """Mark `cwd` trusted in the Claude Code config, before launching.
 
@@ -65,44 +77,60 @@ def preseed_trust(cwd, config_path=None):
 
     or ``{"error": ..., "message": ...}`` if the config could not be read.
     On error the config file is left exactly as it was.
+
+    Claude Code rewrites this same file continuously, so this is a
+    read-modify-write against a moving target. The atomic replace stops a
+    torn file but not a *lost update*: anything Claude wrote between the read
+    and the replace would be dropped. The mtime is therefore re-checked
+    immediately before the replace, and a change re-reads and re-applies
+    instead of overwriting (2026-11-03 review, finding 10).
     """
     config_path = config_path or claude_config_path()
     key = normalized_key(cwd)
 
-    try:
-        with open(config_path) as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        data = {}
-    except (json.JSONDecodeError, OSError) as e:
-        # Never clobber a config we cannot parse — it holds credentials.
-        return {"error": "config_unreadable",
-                "message": f"Cannot read {config_path}: {e}", "key": key}
+    for _ in range(TRUST_WRITE_ATTEMPTS):
+        seen = _stat_ns(config_path)
+        try:
+            with open(config_path) as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            data = {}
+        except (json.JSONDecodeError, OSError) as e:
+            # Never clobber a config we cannot parse — it holds credentials.
+            return {"error": "config_unreadable",
+                    "message": f"Cannot read {config_path}: {e}", "key": key}
 
-    if not isinstance(data, dict):
-        return {"error": "config_malformed",
-                "message": f"{config_path} is not a JSON object", "key": key}
+        if not isinstance(data, dict):
+            return {"error": "config_malformed",
+                    "message": f"{config_path} is not a JSON object", "key": key}
 
-    projects = data.setdefault("projects", {})
-    if not isinstance(projects, dict):
-        return {"error": "config_malformed",
-                "message": f"{config_path}: 'projects' is not an object", "key": key}
+        projects = data.setdefault("projects", {})
+        if not isinstance(projects, dict):
+            return {"error": "config_malformed",
+                    "message": f"{config_path}: 'projects' is not an object", "key": key}
 
-    entry = projects.setdefault(key, {})
-    if not isinstance(entry, dict):
-        return {"error": "config_malformed",
-                "message": f"{config_path}: project entry for {key} is not an object",
-                "key": key}
+        entry = projects.setdefault(key, {})
+        if not isinstance(entry, dict):
+            return {"error": "config_malformed",
+                    "message": f"{config_path}: project entry for {key} is not an object",
+                    "key": key}
 
-    changed = [k for k in TRUST_KEYS if entry.get(k) is not True]
-    if not changed:
-        return {"key": key, "changed": []}
+        changed = [k for k in TRUST_KEYS if entry.get(k) is not True]
+        if not changed:
+            return {"key": key, "changed": []}
 
-    for k in changed:
-        entry[k] = True
+        for k in changed:
+            entry[k] = True
 
-    _atomic_write_json(config_path, data)
-    return {"key": key, "changed": changed}
+        if _stat_ns(config_path) != seen:
+            continue                     # Claude wrote mid-flight: re-read
+        _atomic_write_json(config_path, data)
+        return {"key": key, "changed": changed}
+
+    return {"error": "config_busy",
+            "message": f"{config_path} kept changing under this write "
+                       f"({TRUST_WRITE_ATTEMPTS} attempts); retry on the next launch",
+            "key": key}
 
 
 def _atomic_write_json(path, data):

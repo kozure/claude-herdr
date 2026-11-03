@@ -564,6 +564,15 @@ Thresholds resolve per row as `row value ?? liveness.toml ?? restated defaults`.
   held across a dispatch**. The remedy — an explicit `timeout=` on
   `ledger.py`'s connect — is a `ledger.py` change owned by a later item.
 
+## Agent skill contract
+
+[SKILL.md](SKILL.md) is the machine-global contract any agent should read
+before its first bridge call: socket + client, mandatory ledger tagging with
+caller identity, the 3-consecutive-`idle` readiness rule, liveness habits
+(backstop timeouts are not liveness), session ownership, the reporting rule
+(a brief that never asks for a report finishes silently), the completion
+watcher, and the worker-limit scope.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

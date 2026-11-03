@@ -1,0 +1,17 @@
+# runtime state
+ledger.db*
+*.dmp
+
+# python
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# runtime artifacts (not source)
+cases/
+transcripts/
+
+# personal orchestration scripts + internal report (kept locally, not published)
+dispatch_ats_resume.py
+dispatch_webui_frontier.py
+smoke_spike_report.md

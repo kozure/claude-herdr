@@ -1,0 +1,9 @@
+{
+  "claude_version": "2.1.251",
+  "default_cwd": "~/DEV",
+  "api_fallback": {
+    "enabled": false,
+    "requires_chris_permission": true,
+    "note": "API-key fallback. Never automatic. Requires an explicit human grant."
+  }
+}

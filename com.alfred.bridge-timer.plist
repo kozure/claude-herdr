@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.alfred.bridge-timer</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/USERNAME/qwenpaw/qwen_env/bin/python</string>
+        <string>/Users/USERNAME/qwenpaw/workspaces/workspaces/alfred/claude_bridge/timer.py</string>
+        <string>--tick</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>60</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/USERNAME/.local/share/claude_bridge/bridge-timer.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/USERNAME/.local/share/claude_bridge/bridge-timer.log</string>
+    <key>WorkingDirectory</key>
+    <string>/Users/USERNAME/qwenpaw/workspaces/workspaces/alfred/claude_bridge</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/USERNAME/qwenpaw/qwen_env/bin:/Users/USERNAME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>

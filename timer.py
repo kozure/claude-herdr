@@ -68,7 +68,7 @@ def _payload(job):
 
 def _notify(job):
     status = notify.notify_completion(
-        run_id=job["job_id"], verdict="due", grade=f"timer:{job['agent_id']}",
+        run_id=job["job_id"], verdict="due", grade=f"timer:{job['caller_agent_id']}",
         report_path=job["payload_ref"] or "", digest=_payload(job).strip()[:500])
     if isinstance(status, str) and status.startswith("UNSENT"):
         raise RuntimeError(status)
@@ -76,7 +76,10 @@ def _notify(job):
 
 def _send(job):
     from bridge import Bridge  # lazy: constructing it reaches herdr
-    result = Bridge().send(_payload(job), agent_id=job["agent_id"])
+    # caller_agent_id, never agent_id: `agent_id` on a jobs row is the herdr
+    # target the probe ladder watches, and conflating the two made every send
+    # job look like a session called "alfred" (2026-11-03 review, finding 5).
+    result = Bridge().send(_payload(job), agent_id=job["caller_agent_id"])
     if isinstance(result, dict) and result.get("error"):
         raise RuntimeError(f"send: {result['error']}: {result.get('message', '')}")
 
@@ -196,14 +199,16 @@ def tick(conn, now=None, allow_spend=False, watchdog=None, watcher=None):
 
 # --- the list ----------------------------------------------------------------
 
-LIST_COLUMNS = ("job_id", "status", "action", "agent_id", "due_at", "attempts",
-                "lease_s", "last_error")
+#: `caller_agent_id` is the owning agent; the row's `agent_id` is the herdr
+#: target the probe ladder watches and is empty until the job fires.
+LIST_COLUMNS = ("job_id", "status", "action", "caller_agent_id", "due_at",
+                "attempts", "lease_s", "last_error")
 
 
 def render_list(conn):
     rows = [r for r in schedule.list_jobs(conn) if r["status"] in LIST_STATUSES]
     table = [LIST_COLUMNS] + [
-        tuple(str(v) for v in (r["job_id"], r["status"], r["action"], r["agent_id"],
+        tuple(str(v) for v in (r["job_id"], r["status"], r["action"], r["caller_agent_id"],
                                r["due_at"], r["attempts"], schedule.lease_s(r["action"]),
                                r["last_error"] or "-"))
         for r in rows]

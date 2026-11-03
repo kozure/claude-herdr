@@ -38,9 +38,18 @@ from composer_state import ComposerReading, classify_composer, sentinel_for
 
 # --- The `jobs` row shape --------------------------------------------------
 
-#: The 15 carried columns, in row order. The design's row (§6) carries 16; the
+#: The 16 carried columns, in row order. The design's row (§6) carries 16; the
 #: one deliberate omission is `run_id` — there is no run identity in the ledger
 #: today (Non-Goal 6 / D3), so the column is absent rather than nullable-and-unused.
+#:
+#: `agent_id` and `caller_agent_id` are deliberately separate (2026-11-03):
+#: `agent_id` is the **herdr target** the probe ladder watches — a ledger
+#: `task_id`, or "" when the job has not fired and has no session yet —
+#: while `caller_agent_id` is the **owning agent**, the identity `send`
+#: hands to `Bridge.send()`. One column could not mean both: a `send` job
+#: created ahead of its due time was being probed as `agent_get("alfred")`,
+#: which reads as undecidable and raises a stuck-candidate for a job that has
+#: not run yet.
 JOBS_COLUMNS = (
     "job_id",
     "due_at",
@@ -49,6 +58,7 @@ JOBS_COLUMNS = (
     "action",
     "payload_ref",
     "agent_id",
+    "caller_agent_id",
     "attempts",
     "max_attempts",
     "backoff_s",
@@ -170,8 +180,9 @@ LIVENESS_TOML_ENV = "CLAUDE_BRIDGE_LIVENESS_TOML"
 # --- The substrate (`1.0`) -------------------------------------------------
 
 #: Column declarations, keyed by `JOBS_COLUMNS` so the table cannot drift from
-#: the frozen row shape. `agent_id` is NOT NULL as a backstop only: `add_job`
-#: refuses a missing one first, by name.
+#: the frozen row shape. `caller_agent_id` is NOT NULL as a backstop only:
+#: `add_job` refuses a missing one first, by name. `agent_id` may be "" — a job
+#: scheduled ahead of its run has no session for the probe ladder to watch.
 _COLUMN_DECLS = {
     "job_id": "TEXT PRIMARY KEY",
     "due_at": "TEXT NOT NULL",
@@ -181,7 +192,8 @@ _COLUMN_DECLS = {
     ),
     "action": "TEXT NOT NULL",
     "payload_ref": "TEXT",
-    "agent_id": "TEXT NOT NULL",
+    "agent_id": "TEXT NOT NULL DEFAULT ''",
+    "caller_agent_id": "TEXT NOT NULL DEFAULT ''",
     "attempts": "INTEGER NOT NULL DEFAULT 0",
     "max_attempts": "INTEGER NOT NULL",
     "backoff_s": "INTEGER NOT NULL",
@@ -213,11 +225,26 @@ def _connect(path: str | None = None) -> sqlite3.Connection:
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    """Create `jobs` if absent. Additive only: no `ALTER`, no migration, and
-    nothing in `tasks` is read or written."""
+    """Create `jobs` if absent. Additive only: no migration of `tasks`, and
+    nothing in `tasks` is read or written.
+
+    One additive ALTER is applied to a `jobs` table created before
+    `caller_agent_id` existed (2026-11-03). Existing rows are backfilled from
+    the old overloaded `agent_id`, and `send` rows lose that value as a target
+    because a `send` job's target is unknown until it fires.
+    """
     cols = ", ".join(f"{c} {_COLUMN_DECLS[c]}" for c in JOBS_COLUMNS)
     with conn:
         conn.execute(f"CREATE TABLE IF NOT EXISTS jobs ({cols})")
+        have = {r[1] for r in conn.execute("PRAGMA table_info(jobs)")}
+        if "caller_agent_id" not in have:
+            conn.execute(
+                "ALTER TABLE jobs ADD COLUMN caller_agent_id TEXT NOT NULL DEFAULT ''")
+            conn.execute(
+                "UPDATE jobs SET caller_agent_id = agent_id"
+                " WHERE caller_agent_id = '' AND agent_id != ''")
+            conn.execute(
+                "UPDATE jobs SET agent_id = '' WHERE action = 'send' AND agent_id != ''")
 
 
 def utc_iso(when: datetime | None = None) -> str:
@@ -268,8 +295,9 @@ def add_job(
     job_id: str,
     *,
     action: str,
-    agent_id: str,
+    caller_agent_id: str,
     due_at: str,
+    agent_id: str = "",
     payload_ref: str | None = None,
     max_attempts: int = 3,
     backoff_s: int = 60,
@@ -281,10 +309,14 @@ def add_job(
 
     Refuses an action with no declared `ACTION_WORST_CASE_S`, an inline
     payload (`payload_ref` names a path, it never carries content), and a
-    missing `agent_id`.
+    missing `caller_agent_id`. `agent_id` is the herdr target the probe
+    ladder watches and defaults to "" — a job that has not fired yet has no
+    session, and probing the caller's name as if it were a `task_id` is what
+    produced false stuck-candidates (2026-11-03 review, finding 5).
     """
-    if not agent_id:
-        raise ValueError(f"agent_id is required on every job row, got {agent_id!r}")
+    if not caller_agent_id:
+        raise ValueError(
+            f"caller_agent_id is required on every job row, got {caller_agent_id!r}")
     if action not in ACTION_WORST_CASE_S:
         raise ValueError(
             f"action {action!r} declares no ACTION_WORST_CASE_S; refusing to schedule it"
@@ -299,9 +331,11 @@ def add_job(
     with conn:
         conn.execute(
             "INSERT INTO jobs (job_id, due_at, created_at, status, action, payload_ref,"
-            " agent_id, attempts, max_attempts, backoff_s, probe, warn_s, stuck_s)"
-            " VALUES (?, ?, ?, 'due', ?, ?, ?, 0, ?, ?, ?, ?, ?)",
-            (job_id, utc_iso(parsed), utc_iso(), action, payload_ref, agent_id,
+            " agent_id, caller_agent_id, attempts, max_attempts, backoff_s, probe,"
+            " warn_s, stuck_s)"
+            " VALUES (?, ?, ?, 'due', ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)",
+            (job_id, utc_iso(parsed), utc_iso(), action, payload_ref,
+             agent_id or "", caller_agent_id,
              max_attempts, backoff_s, probe, warn_s, stuck_s),
         )
 
@@ -776,14 +810,21 @@ def _flag_ledger_stuck(conn, row, result: ProbeResult, now: str, notifier=None) 
         import notify
 
         notifier = notify.notify_completion
+    # Latch first, guarded, exactly as `escalate` does: the UPDATE is the point
+    # of mutual exclusion. Notifying first let two concurrent ticks both send —
+    # the docstring's "two ticks cannot both notify" only holds if the write
+    # that claims the row happens before the side effect.
+    with conn:
+        cur = conn.execute(
+            "UPDATE tasks SET notified_state = ?, notified_at = ?"
+            " WHERE task_id = ? AND notified_state IS ?",
+            (STUCK_LATCH, now, row["task_id"], row["notified_state"]),
+        )
+    if cur.rowcount != 1:
+        return "latched"
     sent = notifier(f"stuck-{row['task_id']}", STUCK_LATCH, reason,
                     f"tasks/{row['task_id']}#working", json.dumps(candidate))
     candidate["notify"] = sent
-    with conn:
-        conn.execute(
-            "UPDATE tasks SET notified_state = ?, notified_at = ? WHERE task_id = ?",
-            (STUCK_LATCH, now, row["task_id"]),
-        )
     return "stuck_candidate"
 
 
@@ -804,6 +845,12 @@ def watchdog(conn, now: str, *, toml_path=None, client=None, socket_path=None, n
     for job in rows:
         th = resolve_thresholds(job, toml_path)
         if not should_probe(job, now, th):
+            continue
+        if not job["agent_id"]:
+            # No session yet (a `send` job ahead of its due time has no herdr
+            # target). Probing the caller's name as a task_id read as
+            # undecidable and raised a stuck-candidate for a job that had not
+            # run — skip it until it fires and the target is recorded.
             continue
         state, pane = _ledger_task(conn, job["agent_id"])
         result = probe(job["agent_id"], pane, now, client=client,

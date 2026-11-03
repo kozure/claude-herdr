@@ -36,17 +36,38 @@ ALLOWED_CWD_EXTRA_ROOTS = (
 
 
 def cwd_allowed(cwd: str) -> bool:
-    """True when ``cwd`` is under an allowed root (DEV or an agent workspace)."""
-    return cwd.startswith(ALLOWED_CWD) or any(
-        cwd.startswith(root) for root in ALLOWED_CWD_EXTRA_ROOTS
-    )
+    """True when ``cwd`` resolves inside an allowed root (DEV or a workspace).
+
+    Both sides are resolved with ``realpath`` and compared with ``commonpath``
+    so neither ``../`` traversal nor a shared string prefix can escape: the
+    pre-2026-11-03 check was a bare ``startswith``, which admitted
+    ``~/DEV/../.ssh`` and ``~/DEVIOUS``. The check runs before
+    ``preseed_trust`` marks the folder trusted, so a bypass would have been a
+    trust-planting primitive for any guest agent.
+    """
+    path = os.path.realpath(cwd)
+    roots = [os.path.realpath(ALLOWED_CWD)]
+    roots += [os.path.realpath(r) for r in ALLOWED_CWD_EXTRA_ROOTS]
+    for root in roots:
+        try:
+            if os.path.commonpath([path, root]) == root:
+                return True
+        except ValueError:
+            # Different drives (Windows) — not a containment.
+            continue
+    return False
 
 
 UNKNOWN_RETRY_INTERVAL = 2
 UNKNOWN_MAX_RETRIES = 5
 IDLE_CONFIRMATIONS = 3
+#: Wall-clock ceiling for the readiness handshake. Without it the loop below
+#: spins forever on a pane stuck `working`/`unknown` or on a dialog that keeps
+#: coming back — and inside a launchd tick that stalls the scheduler, the
+#: watchdog and the watcher at once (launchd will not start a second tick).
+STARTUP_DEADLINE_S = float(os.environ.get("CLAUDE_BRIDGE_STARTUP_DEADLINE_S", 180))
 HERDR_DOWN_MSG = ("herdr server is not running. Start with: "
-                  "launchctl load ~/Library/LaunchAgents/com.luther.herdr.plist")
+                  "launchctl load ~/Library/LaunchAgents/com.alfred.herdr.plist")
 
 # Residual-dialog detection. Pre-seeding (trust.preseed_trust) is the primary
 # defence; these are the fallback for a directory that was created *after*
@@ -131,6 +152,34 @@ class Bridge:
         self.ledger.init_schema()
         self.default_cwd = default_cwd or ALLOWED_CWD
 
+    def _fail(self, result, task_id, pane_id, mcp_config):
+        """Finish a failed dispatch: name the session and drop the temp config.
+
+        Anything that fails after ``agent_start`` leaves a live pane behind. The
+        ledger row written at that point is what makes the leftover findable —
+        without it the caller cannot kill the session and the watcher never sees
+        it, which is exactly the orphan case SKILL.md warns about. The temp MCP
+        config is deleted here because no paired session will ever own it.
+        """
+        result.setdefault("task_id", task_id)
+        result.setdefault("pane_id", pane_id)
+        if mcp_config and getattr(mcp_config, "config_path", None):
+            try:
+                from mcp_pair import cleanup_config
+                cleanup_config(mcp_config.config_path)
+            except Exception:  # noqa: BLE001 — cleanup must not mask the real error
+                pass
+            try:
+                self.ledger.clear_mcp_path(task_id)
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            state = "blocked" if result.get("error") == "blocked" else "unknown"
+            self.ledger.update_last_state(task_id, state)
+        except Exception:  # noqa: BLE001
+            pass
+        return result
+
     def send(self, prompt, cwd=None, session_id=None, timeout_min=30,
              mcp_pair=None, mcp_agents=None, agent_id=None, pane_id=None):
         """Start a Claude session, optionally send a prompt.
@@ -151,33 +200,25 @@ class Bridge:
             # --- MCP pairing: auto-pair when agent_id is known ---
             if mcp_pair is None:
                 mcp_pair = bool(agent_id and agent_id != "legacy")
+            # One id for the whole dispatch, generated before anything is
+            # created so every later error can name the session it left behind.
+            task_id = f"task-{uuid.uuid4().hex[:8]}"
             mcp_config = None
             if mcp_pair:
                 from mcp_pair import pairing_config, write_config, PairingError
                 try:
                     mcp_config = pairing_config(
                         caller_agent_id=agent_id or "legacy",
+                        target_agent=None,
                         allowlist=mcp_agents,
+                        task_id=task_id,
                         depth=1,
                     )
-                except PairingError as e:
-                    return {"error": "mcp_pair_error", "message": str(e)}
-                # Set task_id now so the session prefix is generated
-                # We need task_id before workspace_create — generate it here
-                task_id = f"task-{uuid.uuid4().hex[:8]}"
-                mcp_config = pairing_config(
-                    caller_agent_id=agent_id or "legacy",
-                    target_agent=None,
-                    allowlist=mcp_agents,
-                    task_id=task_id,
-                    depth=1,
-                )
-                # Write the temp config file
-                try:
+                    # Write the temp config file
                     mcp_config = write_config(mcp_config)
                 except PairingError as e:
-                    # Can't happen from write_config, but belt-and-suspenders
-                    return {"error": "mcp_pair_error", "message": str(e)}
+                    return {"error": "mcp_pair_error", "message": str(e),
+                            "task_id": task_id}
 
             # --- Original launch flow ---
             if pane_id:
@@ -193,13 +234,9 @@ class Bridge:
                 trust = preseed_trust(os.path.realpath(cwd))
                 ws = self.herdr.workspace_create(cwd=cwd)
                 pane_id, workspace_id = ws.get("pane_id", ""), ws.get("workspace_id", "")
-            if not mcp_pair:
-                task_id = f"task-{uuid.uuid4().hex[:8]}"
             args = []
             if session_id:
                 args = ["--resume", session_id]
-            elif args is not None:
-                args = list(args) if args else []
             # MCP pairing args
             if mcp_config and mcp_config.config_path:
                 args = (args or []) + [
@@ -209,19 +246,52 @@ class Bridge:
             try: self.herdr.agent_start(name=task_id, kind="claude", pane_id=pane_id, cwd=cwd, args=args or None)
             except AgentNotReady: pass  # blocked on a dialog — handled below
 
+            # The row goes in as soon as the pane exists: from here on a live
+            # session exists, and a session with no ledger row is an orphan the
+            # watcher can never see. Prompt/pending/session are filled in after
+            # the handshake (update_send_result).
+            self.ledger.insert_task(
+                task_id=task_id, pane_id=pane_id, workspace_id=workspace_id,
+                session_id=session_id or "", prompt="", cwd=cwd,
+                timeout_min=timeout_min, pending_result=False,
+                agent_id=agent_id or "legacy",
+                mcp_config_path=mcp_config.config_path if mcp_config else None,
+                mcp_target=mcp_config.target_agent if mcp_config else None,
+                mcp_session_prefix=mcp_config.session_prefix if mcp_config else None)
+
             idle_count = 0
+            deadline = time.monotonic() + STARTUP_DEADLINE_S
+            pane_text = ""
             while idle_count < IDLE_CONFIRMATIONS:
+                if time.monotonic() >= deadline:
+                    return self._fail(
+                        {"error": "not_ready",
+                         "message": f"Pane not ready after {STARTUP_DEADLINE_S:g}s "
+                                    f"(idle confirmations {idle_count}/{IDLE_CONFIRMATIONS}). "
+                                    "Pane left as-is for inspection.",
+                         "pane_text": pane_text[:200], "trust_preseed": trust},
+                        task_id, pane_id, mcp_config)
                 try: agent = self.herdr.agent_get(task_id)
                 except AgentNotReady: agent = {"agent_status": "blocked"}
+                except HerdrAPIError as e:
+                    if e.code == "agent_not_found":
+                        return self._fail(
+                            {"error": "not_ready",
+                             "message": "Agent disappeared during startup.",
+                             "pane_text": pane_text[:200], "trust_preseed": trust},
+                            task_id, pane_id, mcp_config)
+                    raise
                 status = agent.get("agent_status", "unknown")
                 if status == "blocked":
                     idle_count = 0
                     pane_text = self.herdr.pane_read(pane_id, source="visible")
                     answer = _residual_dialog_answer(pane_text)
                     if answer is None:
-                        return {"error": "blocked", "message": "Agent blocked on permission prompt. Surface to the operator.",
-                                "pane_text": pane_text[:200],
-                                "trust_preseed": trust}
+                        return self._fail(
+                            {"error": "blocked", "message": "Agent blocked on permission prompt. Surface to the operator.",
+                             "pane_text": pane_text[:200],
+                             "trust_preseed": trust},
+                            task_id, pane_id, mcp_config)
                     for key in answer:
                         self.herdr.pane_send_keys(pane_id, key)
                         time.sleep(1)
@@ -260,14 +330,9 @@ class Bridge:
                     pending = verdict["verified"]
             agent = self.herdr.agent_get(task_id)
             claude_session = agent.get("agent_session", {}).get("value", session_id or "")
-            self.ledger.insert_task(
-                task_id=task_id, pane_id=pane_id, workspace_id=workspace_id,
-                session_id=claude_session, prompt=prompt or "", cwd=cwd,
-                timeout_min=timeout_min, pending_result=pending,
-                agent_id=agent_id or "legacy",
-                mcp_config_path=mcp_config.config_path if mcp_config else None,
-                mcp_target=mcp_config.target_agent if mcp_config else None,
-                mcp_session_prefix=mcp_config.session_prefix if mcp_config else None)
+            # The row already exists (written right after agent_start); this
+            # records the wire text and the session id the handshake resolved.
+            self.ledger.update_send_result(task_id, prompt or "", claude_session)
             # The row is written either way; `working` only on acceptance.
             # A rejected dispatch is never collected: collected_at stays NULL
             # and the evidence lives in the returned error dict, not in
@@ -278,7 +343,10 @@ class Bridge:
                                message=f"Dispatch not verified ({verdict['reason']}). "
                                        "Pane left as-is for inspection. Surface to the operator.")
             elif pending:
-                self.ledger.update_last_state(task_id, "working")
+                # pending_result=1 travels with last_state='working'; the row
+                # was inserted with pending 0 because the prompt was not yet
+                # accepted at that point.
+                self.ledger.update_prompt_sent(task_id)
             result = {"task_id": task_id, "pane_id": pane_id}
             if verdict: result.update(verdict)
             if f11_warning: result["f11_warning"] = True
@@ -374,10 +442,18 @@ class Bridge:
             return {"error": "herdr_server_down", "message": HERDR_DOWN_MSG}
 
     def prompt(self, task_id, text):
-        """Send a follow-up prompt to an existing task (multi-turn)."""
+        """Send a follow-up prompt to an existing task (multi-turn).
+
+        A paired task gets the reporting contract on every turn, not just the
+        first: `swarm.launch` starts sessions with an empty prompt and sends
+        the real task through here, so omitting it made every swarm worker
+        silent at the end (the TICKET-444 failure mode).
+        """
         row = self.ledger.get_task(task_id)
         if not row:
             return {"error": "task_not_found", "task_id": task_id}
+        if row.get("mcp_target"):
+            text = _with_reporting_contract(text, task_id, row["mcp_target"])
         try:
             self.ledger.reset_for_prompt(task_id)
             self.herdr.agent_prompt(task_id, text)
@@ -402,6 +478,14 @@ class Bridge:
             self.herdr.pane_close(row["herdr_pane_id"])
             self.ledger.kill_task(task_id)
             return {"task_id": task_id, "state": "killed"}
+        except HerdrAPIError as e:
+            # A pane that is already gone is a killed task, not an error: the
+            # MCP config has been cleared above, so propagating here would
+            # leave the row `working` forever with no way back.
+            if e.code in ("agent_not_found", "pane_not_found", "not_found"):
+                self.ledger.kill_task(task_id)
+                return {"task_id": task_id, "state": "killed", "already_gone": True}
+            raise
         except HerdrServerDown:
             return {"error": "herdr_server_down", "message": HERDR_DOWN_MSG}
 

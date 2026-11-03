@@ -76,7 +76,7 @@ def notified(monkeypatch):
 
 
 def _add(conn, job_id, action, due_at=PAST, **kw):
-    schedule.add_job(conn, job_id, action=action, agent_id="alfred", due_at=due_at, **kw)
+    schedule.add_job(conn, job_id, action=action, caller_agent_id="alfred", due_at=due_at, **kw)
 
 
 def _strand(conn, job_id):
@@ -121,7 +121,7 @@ def test_list_renders_backlog_columns(db_path, conn, capsys):
     assert rc == 0
     header = out.splitlines()[0].split()
     assert header == list(timer.LIST_COLUMNS)
-    assert {"due_at", "attempts", "action", "agent_id", "lease_s"} <= set(header)
+    assert {"due_at", "attempts", "action", "caller_agent_id", "lease_s"} <= set(header)
     lines = {l.split()[0]: l.split() for l in out.splitlines()[1:-1]}
     assert lines["job-due"][1:4] == ["due", "notify", "alfred"]
     assert lines["job-due"][6] == str(max(LEASE_MIN_S, 60))
@@ -415,8 +415,8 @@ def _notifier_double():
 
 def _probe_row(conn, job_id):
     """A `due`, not-yet-due row — older than both probe tiers, thresholds on the row."""
-    schedule.add_job(conn, job_id, action="notify", agent_id="alfred",
-                     due_at=FUTURE, warn_s=1, stuck_s=2)
+    schedule.add_job(conn, job_id, action="notify", caller_agent_id="alfred",
+                     agent_id=f"task-{job_id}", due_at=FUTURE, warn_s=1, stuck_s=2)
     with conn:
         conn.execute("UPDATE jobs SET created_at=? WHERE job_id=?", (STALE, job_id))
 

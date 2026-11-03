@@ -41,6 +41,7 @@ EXPECTED_JOBS_COLUMNS = (
     "action",
     "payload_ref",
     "agent_id",
+    "caller_agent_id",
     "attempts",
     "max_attempts",
     "backoff_s",
@@ -52,11 +53,11 @@ EXPECTED_JOBS_COLUMNS = (
 )
 
 
-def test_jobs_columns_are_exactly_fifteen_and_in_order():
+def test_jobs_columns_are_exactly_sixteen_and_in_order():
     assert schedule.JOBS_COLUMNS == EXPECTED_JOBS_COLUMNS
-    assert len(schedule.JOBS_COLUMNS) == 15
-    # duplicates would still "count" as 15 only if one name were dropped
-    assert len(set(schedule.JOBS_COLUMNS)) == 15
+    assert len(schedule.JOBS_COLUMNS) == 16
+    # duplicates would still "count" as 16 only if one name were dropped
+    assert len(set(schedule.JOBS_COLUMNS)) == 16
 
 
 def test_run_id_is_the_one_deliberate_omission():
@@ -162,8 +163,9 @@ def test_restated_liveness_defaults_and_env_constant():
 
 FROZEN_SIGNATURES = {
     "add_job": (
-        "(conn: sqlite3.Connection, job_id: str, *, action: str, agent_id: str, "
-        "due_at: str, payload_ref: str | None = None, max_attempts: int = 3, "
+        "(conn: sqlite3.Connection, job_id: str, *, action: str, "
+        "caller_agent_id: str, due_at: str, agent_id: str = '', "
+        "payload_ref: str | None = None, max_attempts: int = 3, "
         "backoff_s: int = 60, probe: int | None = None, warn_s: int | None = None, "
         "stuck_s: int | None = None) -> None"
     ),
@@ -184,7 +186,7 @@ FROZEN_SIGNATURES = {
 #: value here would mean a body was quietly filled in outside its owner parent.
 STUB_CALLS = {
     "add_job": lambda: schedule.add_job(
-        None, "job-00000000", action="notify", agent_id="alfred", due_at=NOW
+        None, "job-00000000", action="notify", caller_agent_id="alfred", due_at=NOW
     ),
     "due_jobs": lambda: schedule.due_jobs(None, NOW),
     "claim_due": lambda: schedule.claim_due(None, "job-00000000"),
@@ -289,7 +291,12 @@ def _row(conn, job_id):
 
 
 def _add(conn, job_id="job-1", action="notify", due_at=T0, **kw):
-    schedule.add_job(conn, job_id, action=action, agent_id="alfred", due_at=due_at, **kw)
+    # `agent_id` defaults to a herdr target here so the probe ladder has
+    # something to read, which is what these tests exercise; a job with no
+    # session yet passes agent_id="" explicitly.
+    kw.setdefault("agent_id", "alfred")
+    kw.setdefault("caller_agent_id", "alfred")
+    schedule.add_job(conn, job_id, action=action, due_at=due_at, **kw)
 
 
 def _set_firing(conn, job_id, fired_at):
@@ -348,11 +355,13 @@ def test_ensure_schema_twice_leaves_tasks_byte_identical(tmp_path):
     conn.close()
 
 
-def test_jobs_table_has_the_fifteen_columns_and_agent_id_not_null(db):
+def test_jobs_table_has_the_sixteen_columns_and_caller_not_null(db):
     info = db.execute("PRAGMA table_info(jobs)").fetchall()
     assert tuple(r["name"] for r in info) == schedule.JOBS_COLUMNS
-    assert len(info) == 15
+    assert len(info) == 16
     notnull = {r["name"]: r["notnull"] for r in info}
+    assert notnull["caller_agent_id"] == 1
+    # agent_id stays NOT NULL but may be empty: a job with no session yet.
     assert notnull["agent_id"] == 1
 
 
@@ -378,7 +387,7 @@ def test_path_discipline_repo_ledger_db_untouched(tmp_path):
 
 def test_add_job_round_trips_every_column(db):
     schedule.add_job(
-        db, "job-rt", action="snapshot", agent_id="luther", due_at=T0,
+        db, "job-rt", action="snapshot", caller_agent_id="luther", agent_id="luther", due_at=T0,
         payload_ref="/var/tmp/payload.json", max_attempts=5, backoff_s=90,
         probe=1, warn_s=600, stuck_s=1200,
     )
@@ -387,17 +396,26 @@ def test_add_job_round_trips_every_column(db):
     assert created.endswith("+00:00")
     assert row == {
         "job_id": "job-rt", "due_at": T0, "status": "due", "action": "snapshot",
-        "payload_ref": "/var/tmp/payload.json", "agent_id": "luther", "attempts": 0,
+        "payload_ref": "/var/tmp/payload.json", "agent_id": "luther",
+        "caller_agent_id": "luther", "attempts": 0,
         "max_attempts": 5, "backoff_s": 90, "fired_at": None, "last_error": None,
         "probe": 1, "warn_s": 600, "stuck_s": 1200,
     }
 
 
-@pytest.mark.parametrize("agent_id", [None, ""])
-def test_add_job_refuses_missing_agent_id_without_inserting(db, agent_id):
-    with pytest.raises(ValueError, match="agent_id"):
-        schedule.add_job(db, "job-x", action="notify", agent_id=agent_id, due_at=T0)
+@pytest.mark.parametrize("caller", [None, ""])
+def test_add_job_refuses_missing_caller_agent_id_without_inserting(db, caller):
+    with pytest.raises(ValueError, match="caller_agent_id"):
+        schedule.add_job(db, "job-x", action="notify", caller_agent_id=caller, due_at=T0)
     assert db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+
+
+def test_add_job_allows_an_empty_herdr_target(db):
+    """A job scheduled ahead of its run has no session to probe (finding 5)."""
+    schedule.add_job(db, "job-n", action="send", caller_agent_id="alfred", due_at=T0)
+    row = dict(db.execute("SELECT * FROM jobs WHERE job_id = 'job-n'").fetchone())
+    assert row["caller_agent_id"] == "alfred"
+    assert row["agent_id"] == ""
 
 
 def test_add_job_refuses_undeclared_action(db):
@@ -745,7 +763,8 @@ def _job(conn, job_id):
 
 def _watched(conn, job_id="job-w", **kw):
     """A pending watched row: due far in the future, created at T0."""
-    schedule.add_job(conn, job_id, action="notify", agent_id=TASK, due_at=_at(86_400), **kw)
+    schedule.add_job(conn, job_id, action="notify", caller_agent_id="alfred",
+                     agent_id=TASK, due_at=_at(86_400), **kw)
     with conn:
         conn.execute("UPDATE jobs SET created_at = ? WHERE job_id = ?", (T0, job_id))
 
@@ -1437,3 +1456,69 @@ def test_watchdog_on_a_rearmed_failure_never_touches_attempts(fdb, no_toml):
     row = _dict(fdb, "j")
     assert (row["status"], row["attempts"]) == ("due", 1)
     assert row["last_error"].startswith("probe_miss ")  # the residual, pinned so a fix is visible
+
+
+# --- 2026-11-03 review, finding 5: `agent_id` is the herdr target, not the caller
+
+def test_send_job_with_no_target_is_never_probed(db, no_toml):
+    """A `send` job scheduled ahead of its run has no session to read.
+
+    Probing it used to call `agent_get("alfred")` — the caller's name read as a
+    task id — which classified as undecidable and raised a stuck-candidate for a
+    job that had not run yet.
+    """
+    _add(db, job_id="job-s", action="send", agent_id="", due_at=_at(86_400))
+    with db:
+        db.execute("UPDATE jobs SET created_at = ? WHERE job_id = 'job-s'", (T0,))
+    calls, notifier = _notifier()
+    client = FakeClient(herdr_client.HerdrTimeout("hung"))
+    assert schedule.watchdog(db, _at(5000), client=client,
+                             notifier=notifier) == {"probe_miss": 0, "stuck_candidates": 0}
+    assert client.calls == []          # nothing dispatched yet
+    assert calls == []                 # and therefore nothing to notify
+
+
+def test_a_watched_job_probes_its_target_not_its_caller(db, no_toml):
+    seen = []
+
+    class Recording(FakeClient):
+        def agent_get(self, target):
+            seen.append(target)
+            return super().agent_get(target)
+
+    _add(db, job_id="job-t", action="send", caller_agent_id="alfred",
+         agent_id="task-abc12345", due_at=_at(86_400))
+    with db:
+        db.execute("UPDATE jobs SET created_at = ? WHERE job_id = 'job-t'", (T0,))
+    _, notifier = _notifier()
+    schedule.watchdog(db, _at(5000), client=Recording({"agent_status": "working"}),
+                      notifier=notifier)
+    assert seen == ["task-abc12345"]
+
+
+# --- 2026-11-03 review, finding 6: latch first, then notify ----------------
+
+def _ledger_working_task(tmp_path, db):
+    led = ledger.Ledger(str(tmp_path / "ledger.db"))
+    led.init_schema()
+    with led.conn:
+        led.conn.execute(
+            "INSERT INTO tasks (task_id, agent_id, prompt, created_at, herdr_pane_id,"
+            " last_state) VALUES (?, 'alfred', 'fixture', ?, 'pane-9', 'working')",
+            (TASK, T0))
+    return db.execute(
+        "SELECT task_id, agent_id, herdr_pane_id, created_at, notified_state"
+        " FROM tasks WHERE task_id = ?", (TASK,)).fetchone()
+
+
+def test_ledger_stuck_latch_is_claimed_before_the_notify(db, no_toml, tmp_path):
+    row = _ledger_working_task(tmp_path, db)
+    calls, notifier = _notifier()
+    result = schedule.ProbeResult("blocked", None, None, ("agent_get",))
+    assert schedule._flag_ledger_stuck(db, row, result, _at(5000), notifier) == "stuck_candidate"
+    assert len(calls) == 1
+    row2 = db.execute(
+        "SELECT task_id, agent_id, herdr_pane_id, created_at, notified_state"
+        " FROM tasks WHERE task_id = ?", (TASK,)).fetchone()
+    assert schedule._flag_ledger_stuck(db, row2, result, _at(5001), notifier) == "latched"
+    assert len(calls) == 1, "the latch is claimed by the guarded UPDATE, so one notify"

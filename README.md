@@ -372,7 +372,7 @@ cd /path/to/v2/clande_bridge_dir && python3 bridge_v2.py
 
 ## Notes
 
-- **CWD Rule:** Sessions may be spawned under `~/DEV` (the default) or an agent workspace under `~/qwenpaw/workspaces/workspaces/`. Any other cwd is refused. Always pass cwd: `bridge.send("task", cwd="~/DEV")`.
+- **CWD Rule:** Sessions may be spawned under `~/DEV` (the default) or an agent workspace under `~/qwenpaw/workspaces/workspaces/`. Any other cwd is refused. Always pass cwd: `bridge.send("task", cwd="~/DEV")`. Containment is `realpath` + `commonpath` on both sides, so `~/DEV/../.ssh` and `~/DEVIOUS` are refused rather than accepted on a string prefix — the check runs before `preseed_trust` marks the folder trusted.
 - **Pro Plan OAuth:** The bridge uses Claude CLI Pro plan interactive mode — no API keys or raw tokens.
 - **Manual Only:** This skill is invoked manually (no auto-triggers). Use for async/convenience access to Claude Code sessions.
 - **Pane History:** herdr panes maintain full scrollback history, which the bridge uses for result parsing.

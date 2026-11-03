@@ -189,6 +189,19 @@ class Ledger:
         )
         self.conn.commit()
 
+    def update_send_result(self, task_id, prompt, session_id):
+        """Record what the handshake resolved: the wire prompt and the session id.
+
+        The row itself is written right after `agent_start` (before the
+        readiness loop) so a failed dispatch never leaves an unregistered pane;
+        these two values are only known once the pane is ready.
+        """
+        self.conn.execute(
+            "UPDATE tasks SET prompt=?, claude_session_id=? WHERE task_id=?",
+            (prompt or "", session_id or "", task_id)
+        )
+        self.conn.commit()
+
     def reset_for_prompt(self, task_id):
         """Reset collection state for a new prompt (multi-turn)."""
         self.conn.execute(

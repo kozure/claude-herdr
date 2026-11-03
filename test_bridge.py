@@ -1011,3 +1011,143 @@ class TestReportingContract:
         assert row["prompt"] == sent
         if row.get("mcp_config_path"):
             _os.unlink(row["mcp_config_path"])
+
+
+# ---------------------------------------------------------------------------
+# Review findings (2026-11-03) — regression tests
+# ---------------------------------------------------------------------------
+
+class TestCwdContainment:
+    """Finding 1: the folder check must survive `..` and a shared prefix."""
+
+    @pytest.mark.parametrize("escape", [
+        f"{HOME}/DEV/../.ssh",
+        f"{HOME}/DEVIOUS",
+        f"{HOME}/qwenpaw/workspaces/workspaces/../../../.config",
+        f"{HOME}/DEV/../qwenpaw",
+    ])
+    def test_traversal_and_prefix_neighbours_are_refused(self, escape):
+        from bridge import cwd_allowed
+        assert cwd_allowed(escape) is False
+
+    @pytest.mark.parametrize("allowed", [
+        f"{HOME}/DEV",
+        f"{HOME}/DEV/project",
+        f"{HOME}/qwenpaw/workspaces/workspaces/alfred",
+    ])
+    def test_real_roots_are_still_allowed(self, allowed):
+        from bridge import cwd_allowed
+        assert cwd_allowed(allowed) is True
+
+    def test_send_refuses_a_traversal_cwd(self, bridge, mock_herdr):
+        result = bridge.send("x", cwd=f"{HOME}/DEV/../.ssh")
+        assert result["error"] == "cwd_not_allowed"
+        mock_herdr.workspace_create.assert_not_called()
+
+
+class TestStartupDeadline:
+    """Finding 2: the startup loop must not run forever."""
+
+    def test_a_never_ready_pane_returns_not_ready(self, bridge, mock_herdr, monkeypatch):
+        import bridge as bridge_module
+        mock_herdr.agent_get.return_value = {"agent_status": "working", "pane_id": "w1:p1"}
+        monkeypatch.setattr(bridge_module, "STARTUP_DEADLINE_S", 0.0)
+        with patch("bridge.time.sleep"):
+            result = bridge.send("x", cwd=f"{HOME}/DEV")
+        assert result["error"] == "not_ready"
+        assert result["task_id"] and result["pane_id"]
+
+    def test_an_unknown_status_also_hits_the_deadline(self, bridge, mock_herdr, monkeypatch):
+        import bridge as bridge_module
+        mock_herdr.agent_get.return_value = {"agent_status": "weird"}
+        monkeypatch.setattr(bridge_module, "STARTUP_DEADLINE_S", 0.0)
+        with patch("bridge.time.sleep"):
+            result = bridge.send("x", cwd=f"{HOME}/DEV")
+        assert result["error"] == "not_ready"
+
+    def test_agent_not_found_during_startup_returns_ids(self, bridge, mock_herdr):
+        mock_herdr.agent_get.side_effect = HerdrAPIError("agent_not_found", "gone")
+        with patch("bridge.time.sleep"):
+            result = bridge.send("x", cwd=f"{HOME}/DEV")
+        assert result["error"] == "not_ready"
+        assert result["task_id"] and result["pane_id"]
+
+
+class TestPartialSendLeavesNoOrphan:
+    """Finding 3: a failed send must still be registered and cleaned up."""
+
+    def test_blocked_error_carries_ids_and_a_ledger_row(
+            self, bridge, mock_herdr, in_memory_ledger, no_real_config_writes):
+        mock_herdr.agent_get.return_value = {"agent_status": "blocked"}
+        mock_herdr.pane_read.return_value = "an unrecognised dialog nobody handles"
+        with patch("bridge.time.sleep"):
+            result = bridge.send("x", cwd=f"{HOME}/DEV", agent_id="alfred")
+        assert result["error"] == "blocked"
+        assert result["task_id"] and result["pane_id"]
+        row = in_memory_ledger.get_task(result["task_id"])
+        assert row is not None, "a live pane with no ledger row is an orphan"
+        assert row["herdr_pane_id"] == result["pane_id"]
+
+    def test_blocked_error_cleans_the_mcp_temp_config(
+            self, bridge, mock_herdr, tmp_path, no_real_config_writes):
+        from mcp_pair import PairingConfig
+        cfg_file = tmp_path / "mcp.json"
+        cfg_file.write_text("{}")
+        fake = PairingConfig(target_agent="default", allowlist="default",
+                             session_prefix="p", config_path=str(cfg_file),
+                             config_json={})
+        mock_herdr.agent_get.return_value = {"agent_status": "blocked"}
+        mock_herdr.pane_read.return_value = "an unrecognised dialog nobody handles"
+        with patch("mcp_pair.write_config", return_value=fake), patch("bridge.time.sleep"):
+            result = bridge.send("x", cwd=f"{HOME}/DEV", agent_id="alfred")
+        assert result["error"] == "blocked"
+        assert not cfg_file.exists(), "temp MCP config leaked after a failed send"
+
+
+class TestPromptReportingContract:
+    """Finding 4: follow-up prompts must carry the reporting block too."""
+
+    def _seed_paired(self, ledger, mcp_target="default"):
+        ledger.insert_task(task_id="task-p", pane_id="w1:p1", workspace_id="w1",
+                           session_id="s", prompt="first", cwd=f"{HOME}/DEV",
+                           timeout_min=30, agent_id="alfred",
+                           mcp_target=mcp_target, mcp_session_prefix="p")
+
+    def test_prompt_adds_the_block_when_the_task_is_paired(
+            self, bridge, mock_herdr, in_memory_ledger):
+        from bridge import REPORTING_MARKER
+        self._seed_paired(in_memory_ledger)
+        with patch("bridge.time.sleep"):
+            bridge.prompt("task-p", "follow up")
+        sent = mock_herdr.agent_prompt.call_args[0][1]
+        assert REPORTING_MARKER in sent
+
+    def test_prompt_leaves_an_unpaired_task_alone(self, bridge, mock_herdr, in_memory_ledger):
+        from bridge import REPORTING_MARKER
+        in_memory_ledger.insert_task(task_id="task-u", pane_id="w1:p1", workspace_id="w1",
+                                     session_id="s", prompt="first", cwd=f"{HOME}/DEV",
+                                     timeout_min=30, agent_id="alfred")
+        with patch("bridge.time.sleep"):
+            bridge.prompt("task-u", "follow up")
+        sent = mock_herdr.agent_prompt.call_args[0][1]
+        assert REPORTING_MARKER not in sent
+
+
+class TestKillIsIdempotent:
+    """Finding 7: a pane that is already gone is a killed task, not an error."""
+
+    def test_missing_agent_is_treated_as_killed(self, bridge, mock_herdr, in_memory_ledger):
+        in_memory_ledger.insert_task(task_id="task-k", pane_id="w1:p1", workspace_id="w1",
+                                     session_id="s", prompt="p", cwd=f"{HOME}/DEV",
+                                     timeout_min=30, agent_id="alfred")
+        mock_herdr.pane_close.side_effect = HerdrAPIError("agent_not_found", "gone")
+        result = bridge.kill("task-k")
+        assert result["state"] == "killed"
+        assert in_memory_ledger.get_task("task-k")["last_state"] == "killed"
+
+
+def test_server_down_message_names_the_installed_plist():
+    """Finding 8: the hint must name the plist that is actually installed."""
+    import bridge as bridge_module
+    assert "com.alfred.herdr.plist" in bridge_module.HERDR_DOWN_MSG
+    assert "com.luther" not in bridge_module.HERDR_DOWN_MSG

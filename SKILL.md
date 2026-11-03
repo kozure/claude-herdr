@@ -79,7 +79,9 @@ finished, correct, and silent for hours because the hand-written brief never
 asked for a report).
 
 - `Bridge.send()` appends a **reporting block** (`REPORTING_BLOCK`,
-  marked by `REPORTING_MARKER`) to every **paired** prompt. Do not remove it.
+  marked by `REPORTING_MARKER`) to every **paired** prompt. `Bridge.prompt()`
+  appends it too, so a follow-up turn (and every `swarm.launch` worker, whose
+  task arrives through `prompt()`) carries it as well. Do not remove it.
   If you compose a prompt yourself, either include your own explicit
   "when you stop, report through `qwenpaw_chat`" section or call
   `_with_reporting_contract(prompt, task_id, target_agent)` from `bridge.py`.
